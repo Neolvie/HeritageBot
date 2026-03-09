@@ -38,6 +38,7 @@ from formatters import (
     truncate_caption,
 )
 from image_utils import crop_region, is_valid_bbox, prepare_image
+from stats import format_stats, record_vision, record_whisper
 
 load_dotenv()
 
@@ -50,6 +51,11 @@ logger = logging.getLogger(__name__)
 # user_id → {"photo_path": str}
 _user_state: dict[int, dict] = {}
 
+# Telegram user IDs allowed to call /stats
+def _stats_allowed_ids() -> set[int]:
+    raw = os.getenv("STATS_USER_IDS", "")
+    return {int(x.strip()) for x in raw.split(",") if x.strip().lstrip("-").isdigit()}
+
 WELCOME = (
     "👋 Добро пожаловать в <b>HeritageBot</b>!\n\n"
     "Я помогу превратить семейные фотографии в структурированный генеалогический архив.\n\n"
@@ -59,7 +65,7 @@ WELCOME = (
     "какие предметы видны, когда и где сделан снимок\n"
     "3️⃣ Получите структурированное описание каждого человека/предмета "
     "и готовый JSON-файл\n\n"
-    "Команды: /reset — сбросить сессию"
+    "Команды: /reset — сбросить сессию | /stats — статистика токенов"
 )
 
 
@@ -76,6 +82,14 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     _cleanup_state(uid)
     await update.message.reply_text("🔄 Сессия сброшена. Отправьте новую фотографию.")
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if uid not in _stats_allowed_ids():
+        await update.message.reply_text("⛔ У вас нет доступа к статистике.")
+        return
+    await update.message.reply_text(format_stats(), parse_mode="HTML")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,6 +182,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Download voice
     voice_obj = update.message.voice or update.message.audio
+    voice_duration_sec: float = getattr(voice_obj, "duration", 0) or 0
     voice_file = await context.bot.get_file(voice_obj.file_id)
     voice_tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
     voice_tmp.close()
@@ -178,17 +193,39 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         # ── 1. Transcribe ────────────────────────────────────────────────────
         transcription = await transcribe_audio(voice_tmp.name)
+
+        # Record Whisper usage (min 1 sec to avoid zero-cost entries)
+        duration = max(voice_duration_sec, 1.0)
+        whisper_price = float(os.getenv("WHISPER_PRICE_PER_MINUTE", "0.006"))
+        record_whisper(
+            duration_seconds=duration,
+            cost_usd=round(duration / 60 * whisper_price, 6),
+        )
+
         await status_msg.edit_text(
             f"✅ Расшифровка:\n<i>{esc(transcription)}</i>\n\n🔍 Анализирую фотографию…",
             parse_mode="HTML",
         )
 
         # ── 2. Analyse ───────────────────────────────────────────────────────
-        result = await analyze_photo(photo_path, transcription)
+        result, usage = await analyze_photo(photo_path, transcription)
+
+        # Record vision usage
+        record_vision(
+            provider=usage.provider,
+            model=usage.model,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cost_usd=usage.cost_usd,
+        )
+
         result["processing_metadata"] = {
             "transcription": transcription,
             "processed_at": datetime.now().isoformat(),
-            "model_used": os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-lite"),
+            "model_used": f"{usage.provider}/{usage.model}",
+            "tokens_in": usage.input_tokens,
+            "tokens_out": usage.output_tokens,
+            "cost_usd": usage.cost_usd,
         }
 
         await status_msg.edit_text("📤 Формирую ответ…")
@@ -302,6 +339,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))

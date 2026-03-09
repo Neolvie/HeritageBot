@@ -20,6 +20,20 @@ from openai import AsyncOpenAI, APIStatusError
 
 logger = logging.getLogger(__name__)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA CLASSES
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class UsageInfo:
+    provider: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PROVIDER REGISTRY
 # ─────────────────────────────────────────────────────────────────────────────
@@ -30,6 +44,8 @@ class Provider:
     base_url: str
     api_key: str
     model: str
+    price_input_per_1m: float       # USD per 1M input tokens
+    price_output_per_1m: float      # USD per 1M output tokens
     json_mode: bool = True          # whether to use response_format=json_object
     extra_headers: dict = field(default_factory=dict)
 
@@ -43,27 +59,36 @@ class Provider:
             default_headers=self.extra_headers,
         )
 
+    def calc_cost(self, input_tokens: int, output_tokens: int) -> float:
+        return round(
+            input_tokens  / 1_000_000 * self.price_input_per_1m
+            + output_tokens / 1_000_000 * self.price_output_per_1m,
+            6,
+        )
+
 
 def _build_provider_list() -> list[Provider]:
     """Return providers ordered: primary first, then fallbacks (only configured ones)."""
+    or_model = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-lite")
     all_providers: dict[str, Provider] = {
         "openai": Provider(
             name="openai",
             base_url="https://api.openai.com/v1",
             api_key=os.getenv("OPENAI_API_KEY", ""),
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            price_input_per_1m=float(os.getenv("OPENAI_PRICE_INPUT_PER_1M", "0.15")),
+            price_output_per_1m=float(os.getenv("OPENAI_PRICE_OUTPUT_PER_1M", "0.60")),
             json_mode=True,
         ),
         "openrouter": Provider(
             name="openrouter",
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY", ""),
-            model=os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-lite"),
+            model=or_model,
+            price_input_per_1m=float(os.getenv("OPENROUTER_PRICE_INPUT_PER_1M", "0.075")),
+            price_output_per_1m=float(os.getenv("OPENROUTER_PRICE_OUTPUT_PER_1M", "0.30")),
             # JSON mode for Gemini/GPT via OpenRouter; disable for Llama etc.
-            json_mode=any(
-                tag in os.getenv("OPENROUTER_MODEL", "")
-                for tag in ("gemini", "gpt-4o", "gpt-4")
-            ),
+            json_mode=any(tag in or_model for tag in ("gemini", "gpt-4o", "gpt-4")),
             extra_headers={
                 "HTTP-Referer": "https://heritagebot.local",
                 "X-Title": "HeritageBot",
@@ -308,10 +333,11 @@ def _normalize_result_bboxes(result: dict) -> dict:
 _FALLBACK_CODES = {402, 429}
 
 
-async def analyze_photo(photo_path: str, transcription: str) -> dict:
+async def analyze_photo(photo_path: str, transcription: str) -> tuple[dict, UsageInfo]:
     """
     Analyse photo + transcription using the configured AI provider.
     Automatically falls back to the next provider on 402 / 429.
+    Returns (result_dict, UsageInfo).
     """
     providers = _build_provider_list()
 
@@ -352,6 +378,20 @@ async def analyze_photo(photo_path: str, transcription: str) -> dict:
 
             logger.debug("Response from %s: %s…", provider.name, content[:200])
 
+            # Extract token usage
+            usage = response.usage
+            input_tokens  = usage.prompt_tokens     if usage else 0
+            output_tokens = usage.completion_tokens if usage else 0
+            cost = provider.calc_cost(input_tokens, output_tokens)
+
+            usage_info = UsageInfo(
+                provider=provider.name,
+                model=provider.model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=cost,
+            )
+
             try:
                 result = _extract_json(content)
             except ValueError as e:
@@ -366,7 +406,7 @@ async def analyze_photo(photo_path: str, transcription: str) -> dict:
                 }
 
             result.setdefault("_provider_used", provider.name)
-            return _normalize_result_bboxes(result)
+            return _normalize_result_bboxes(result), usage_info
 
         except APIStatusError as e:
             if e.status_code in _FALLBACK_CODES:
