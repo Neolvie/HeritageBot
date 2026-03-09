@@ -87,7 +87,6 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     if uid not in _stats_allowed_ids():
-        await update.message.reply_text("⛔ У вас нет доступа к статистике.")
         return
     await update.message.reply_text(format_stats(), parse_mode="HTML")
 
