@@ -1,0 +1,9 @@
+services:
+  heritagebot:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    # Temp files live inside the container; no volume needed for PoC.
+    # Uncomment the line below if you want logs to persist on the host:
+    # volumes:
+    #   - ./logs:/app/logs
